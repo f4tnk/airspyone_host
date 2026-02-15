@@ -67,6 +67,31 @@ if(MSVC)
 else()
 	add_definitions(-Wall)
 
+	# SDR DSP performance optimization flags
+	include(CheckCCompilerFlag)
+
+	check_c_compiler_flag("-march=native" HAS_MARCH_NATIVE)
+	if(HAS_MARCH_NATIVE)
+		add_compile_options(-march=native)
+	endif()
+
+	check_c_compiler_flag("-ffast-math" HAS_FAST_MATH)
+	if(HAS_FAST_MATH)
+		add_compile_options(-ffast-math)
+	endif()
+
+	check_c_compiler_flag("-ftree-vectorize" HAS_TREE_VECTORIZE)
+	if(HAS_TREE_VECTORIZE)
+		add_compile_options(-ftree-vectorize)
+	endif()
+
+	check_c_compiler_flag("-flto" HAS_LTO)
+	if(HAS_LTO)
+		add_compile_options(-flto)
+		set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -flto")
+		set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -flto")
+	endif()
+
 	INCLUDE(TestBigEndian)
 	TEST_BIG_ENDIAN(BIGENDIAN)
 	if(${BIGENDIAN})

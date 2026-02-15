@@ -60,6 +60,10 @@ void *_aligned_malloc(size_t size, size_t alignment)
   #define _aligned_malloc(size, alignment) memalign(alignment, size)
   #define _aligned_free(mem) free(mem)
   #define _inline inline
+  #if defined(__x86_64__) || defined(__i386__)
+    #define USE_SSE2
+    #include <immintrin.h>
+  #endif
 #else
 	#if (_MSC_VER >= 1800)
 		//#define USE_SSE2
@@ -68,7 +72,7 @@ void *_aligned_malloc(size_t size, size_t alignment)
 #endif
 
 #define SIZE_FACTOR 32
-#define DEFAULT_ALIGNMENT 16
+#define DEFAULT_ALIGNMENT 32
 #define HPF_COEFF 0.01f
 
 #if defined(_MSC_VER)
@@ -207,11 +211,7 @@ static _inline float process_fir_taps(const float *kernel, const float *queue, i
 	__m128 t = _mm_add_ps(acc, _mm_movehl_ps(acc, acc));
 	acc = _mm_add_ss(t, _mm_shuffle_ps(t, t, 1));
 
-#ifdef __FreeBSD__
-	float sum = acc[0];
-#else
-	float sum = acc.m128_f32[0];
-#endif
+	float sum = _mm_cvtss_f32(acc);
 
 #endif
 
@@ -400,6 +400,33 @@ static void fir_interleaved_generic(iqconverter_float_t *cnv, float *samples, in
 	cnv->fir_index = fir_index;
 }
 
+static void fir_interleaved_32(iqconverter_float_t *cnv, float *samples, int len)
+{
+	int i;
+	int fir_index = cnv->fir_index;
+	int fir_len = cnv->len;
+	float *fir_kernel = cnv->fir_kernel;
+	float *fir_queue = cnv->fir_queue;
+	float *queue;
+
+	for (i = 0; i < len; i += 2)
+	{
+		queue = fir_queue + fir_index;
+
+		queue[0] = samples[i];
+
+		samples[i] = process_fir_taps(fir_kernel, queue, 32);
+
+		if (--fir_index < 0)
+		{
+			fir_index = fir_len * (SIZE_FACTOR - 1);
+			memcpy(fir_queue + fir_index + 1, fir_queue, (fir_len - 1) * sizeof(float));
+		}
+	}
+
+	cnv->fir_index = fir_index;
+}
+
 static void fir_interleaved(iqconverter_float_t *cnv, float *samples, int len)
 {
 	switch (cnv->len)
@@ -415,6 +442,9 @@ static void fir_interleaved(iqconverter_float_t *cnv, float *samples, int len)
 		break;
 	case 24:
 		fir_interleaved_24(cnv, samples, len);
+		break;
+	case 32:
+		fir_interleaved_32(cnv, samples, len);
 		break;
 	default:
 		fir_interleaved_generic(cnv, samples, len);
@@ -447,7 +477,7 @@ static void delay_interleaved(iqconverter_float_t *cnv, float *samples, int len)
 	cnv->delay_index = index;
 }
 
-#define SCALE (0.01f)
+#define SCALE (0.005f)
 
 static void remove_dc(iqconverter_float_t *cnv, float *samples, int len)
 {

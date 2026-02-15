@@ -94,7 +94,7 @@ int gettimeofday(struct timeval *tv, void* ignored)
 #define INT12_EL_SIZE_BITS (12)
 #define INT8_EL_SIZE_BITS (8)
 
-#define FD_BUFFER_SIZE (16*1024)
+#define FD_BUFFER_SIZE (256*1024)
 
 #define FREQ_ONE_MHZ (1000000ul)
 #define FREQ_ONE_MHZ_U64 (1000000ull)
@@ -103,9 +103,9 @@ int gettimeofday(struct timeval *tv, void* ignored)
 
 #define DEFAULT_FREQ_HZ (900000000ul) /* 900MHz */
 
-#define DEFAULT_VGA_IF_GAIN (5)
-#define DEFAULT_LNA_GAIN (1)
-#define DEFAULT_MIXER_GAIN (5)
+#define DEFAULT_VGA_IF_GAIN (10)
+#define DEFAULT_LNA_GAIN (7)
+#define DEFAULT_MIXER_GAIN (7)
 
 #define PACKING_MAX (0xffffffff)
 

@@ -46,10 +46,14 @@ void * _aligned_malloc(size_t size, size_t alignment);
   #define _aligned_malloc(size, alignment) memalign(alignment, size)
   #define _aligned_free(mem) free(mem)
   #define _inline inline
+  #if defined(__x86_64__) || defined(__i386__)
+    #define USE_SSE2
+    #include <immintrin.h>
+  #endif
 #endif
 
 #define SIZE_FACTOR 16
-#define DEFAULT_ALIGNMENT 16
+#define DEFAULT_ALIGNMENT 32
 
 iqconverter_int16_t *iqconverter_int16_create(const int16_t *hb_kernel, int len)
 {
@@ -171,7 +175,7 @@ static void remove_dc(iqconverter_int16_t *cnv, int16_t *samples, int len)
 	{
 		x = samples[i];
 		w = x - old_x;
-		u = old_e + (int32_t) old_y * 32100;
+		u = old_e + (int32_t) old_y * 32600;
 		s = u >> 15;
 		y = w + s;
 		old_e = u - (s << 15);
@@ -189,6 +193,28 @@ static void translate_fs_4(iqconverter_int16_t *cnv, int16_t *samples, int len)
 {
 	int i;
 
+#ifdef USE_SSE2
+	__m128i mul_mask = _mm_set_epi16(1, 1, -1, -1, 1, 1, -1, -1);
+	__m128i shift_sel = _mm_set_epi16(-1, 0, -1, 0, -1, 0, -1, 0);
+
+	for (i = 0; i + 7 < len; i += 8)
+	{
+		__m128i v = _mm_loadu_si128((__m128i*)(samples + i));
+		v = _mm_mullo_epi16(v, mul_mask);
+		__m128i shifted = _mm_srai_epi16(v, 1);
+		v = _mm_or_si128(
+			_mm_andnot_si128(shift_sel, v),
+			_mm_and_si128(shift_sel, shifted));
+		_mm_storeu_si128((__m128i*)(samples + i), v);
+	}
+	for (; i < len; i += 4)
+	{
+		samples[i + 0] = -samples[i + 0];
+		samples[i + 1] = -samples[i + 1] >> 1;
+		//samples[i + 2] = samples[i + 2];
+		samples[i + 3] = samples[i + 3] >> 1;
+	}
+#else
 	for (i = 0; i < len; i += 4)
 	{
 		samples[i + 0] = -samples[i + 0];
@@ -196,6 +222,7 @@ static void translate_fs_4(iqconverter_int16_t *cnv, int16_t *samples, int len)
 		//samples[i + 2] = samples[i + 2];
 		samples[i + 3] = samples[i + 3] >> 1;
 	}
+#endif
 
 	fir_interleaved(cnv, samples, len);
 	delay_interleaved(cnv, samples + 1, len);

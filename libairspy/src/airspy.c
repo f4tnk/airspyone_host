@@ -39,6 +39,16 @@ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSI
 #include "iqconverter_int16.h"
 #include "filters.h"
 
+#ifdef __linux__
+#include <sched.h>
+#include <unistd.h>
+#endif
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#define USE_SSE2
+#endif
+
 #ifndef bool
 typedef int bool;
 #define true 1
@@ -47,7 +57,7 @@ typedef int bool;
 
 #define PACKET_SIZE (12)
 #define UNPACKED_SIZE (16)
-#define RAW_BUFFER_COUNT (8)
+#define RAW_BUFFER_COUNT (16)
 
 #ifdef AIRSPY_BIG_ENDIAN
 #define TO_LE(x) __builtin_bswap32(x)
@@ -200,7 +210,12 @@ static int allocate_transfers(airspy_device_t* const device)
 	{
 		for (i = 0; i < RAW_BUFFER_COUNT; i++)
 		{
+#ifdef __linux__
+			if (posix_memalign((void**)&device->received_samples_queue[i], 4096, device->buffer_size) != 0)
+				device->received_samples_queue[i] = NULL;
+#else
 			device->received_samples_queue[i] = (uint16_t *)malloc(device->buffer_size);
+#endif
 			if (device->received_samples_queue[i] == NULL)
 			{
 				return AIRSPY_ERROR_NO_MEM;
@@ -218,7 +233,12 @@ static int allocate_transfers(airspy_device_t* const device)
 			sample_count = device->buffer_size / 2;
 		}
 
+#ifdef __linux__
+		if (posix_memalign((void**)&device->output_buffer, 64, sample_count * sizeof(float)) != 0)
+			device->output_buffer = NULL;
+#else
 		device->output_buffer = (float *)malloc(sample_count * sizeof(float));
+#endif
 		if (device->output_buffer == NULL)
 		{
 			return AIRSPY_ERROR_NO_MEM;
@@ -299,6 +319,19 @@ static int prepare_transfers(airspy_device_t* device, const uint_fast8_t endpoin
 static void convert_samples_int16(uint16_t *src, int16_t *dest, int count)
 {
 	int i;
+#ifdef USE_SSE2
+	__m128i offset = _mm_set1_epi16(2048);
+	for (i = 0; i + 7 < count; i += 8)
+	{
+		__m128i raw = _mm_loadu_si128((__m128i*)(src + i));
+		__m128i result = _mm_slli_epi16(_mm_sub_epi16(raw, offset), SAMPLE_SHIFT);
+		_mm_storeu_si128((__m128i*)(dest + i), result);
+	}
+	for (; i < count; i++)
+	{
+		dest[i] = (src[i] - 2048) << SAMPLE_SHIFT;
+	}
+#else
 	for (i = 0; i < count; i += 4)
 	{
 		dest[i + 0] = (src[i + 0] - 2048) << SAMPLE_SHIFT;
@@ -306,11 +339,31 @@ static void convert_samples_int16(uint16_t *src, int16_t *dest, int count)
 		dest[i + 2] = (src[i + 2] - 2048) << SAMPLE_SHIFT;
 		dest[i + 3] = (src[i + 3] - 2048) << SAMPLE_SHIFT;
 	}
+#endif
 }
 
 static void convert_samples_float(uint16_t *src, float *dest, int count)
 {
 	int i;
+#ifdef USE_SSE2
+	__m128 scale_vec = _mm_set1_ps(SAMPLE_SCALE);
+	__m128 offset_vec = _mm_set1_ps(2048.0f);
+	__m128i zero = _mm_setzero_si128();
+	for (i = 0; i + 7 < count; i += 8)
+	{
+		__m128i raw16 = _mm_loadu_si128((__m128i*)(src + i));
+		__m128i raw32_lo = _mm_unpacklo_epi16(raw16, zero);
+		__m128i raw32_hi = _mm_unpackhi_epi16(raw16, zero);
+		__m128 flo = _mm_mul_ps(_mm_sub_ps(_mm_cvtepi32_ps(raw32_lo), offset_vec), scale_vec);
+		__m128 fhi = _mm_mul_ps(_mm_sub_ps(_mm_cvtepi32_ps(raw32_hi), offset_vec), scale_vec);
+		_mm_storeu_ps(dest + i, flo);
+		_mm_storeu_ps(dest + i + 4, fhi);
+	}
+	for (; i < count; i++)
+	{
+		dest[i] = (src[i] - 2048) * SAMPLE_SCALE;
+	}
+#else
 	for (i = 0; i < count; i += 4)
 	{
 		dest[i + 0] = (src[i + 0] - 2048) * SAMPLE_SCALE;
@@ -318,22 +371,28 @@ static void convert_samples_float(uint16_t *src, float *dest, int count)
 		dest[i + 2] = (src[i + 2] - 2048) * SAMPLE_SCALE;
 		dest[i + 3] = (src[i + 3] - 2048) * SAMPLE_SCALE;
 	}
+#endif
 }
 
 static inline void unpack_samples(uint32_t *input, uint16_t *output, int length)
 {
 	int i, j;
+	uint32_t a, b, c;
 
 	for (i = 0, j = 0; j < length; i += 3, j += 8)
 	{
-		output[j + 0] = (input[i] >> 20) & 0xfff;
-		output[j + 1] = (input[i] >> 8) & 0xfff;
-		output[j + 2] = ((input[i] & 0xff) << 4) | ((input[i + 1] >> 28) & 0xf);
-		output[j + 3] = ((input[i + 1] & 0xfff0000) >> 16);
-		output[j + 4] = ((input[i + 1] & 0xfff0) >> 4);
-		output[j + 5] = ((input[i + 1] & 0xf) << 8) | ((input[i + 2] & 0xff000000) >> 24);
-		output[j + 6] = ((input[i + 2] >> 12) & 0xfff);
-		output[j + 7] = ((input[i + 2] & 0xfff));
+		a = input[i];
+		b = input[i + 1];
+		c = input[i + 2];
+
+		output[j + 0] = (a >> 20) & 0xfff;
+		output[j + 1] = (a >> 8) & 0xfff;
+		output[j + 2] = ((a & 0xff) << 4) | ((b >> 28) & 0xf);
+		output[j + 3] = (b >> 16) & 0xfff;
+		output[j + 4] = (b >> 4) & 0xfff;
+		output[j + 5] = ((b & 0xf) << 8) | ((c >> 24) & 0xff);
+		output[j + 6] = (c >> 12) & 0xfff;
+		output[j + 7] = c & 0xfff;
 	}
 }
 
@@ -346,9 +405,13 @@ static void* consumer_threadproc(void *arg)
 	airspy_transfer_t transfer;
 
 #ifdef _WIN32
-
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-
+#elif defined(__linux__)
+	{
+		struct sched_param param;
+		param.sched_priority = sched_get_priority_max(SCHED_FIFO);
+		pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+	}
 #endif
 
 	pthread_mutex_lock(&device->consumer_mp);
@@ -494,12 +557,16 @@ static void* transfer_threadproc(void* arg)
 {
 	airspy_device_t* device = (airspy_device_t*)arg;
 	int error;
-	struct timeval timeout = { 0, 500000 };
+	struct timeval timeout = { 0, 100000 };
 
 #ifdef _WIN32
-
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-
+#elif defined(__linux__)
+	{
+		struct sched_param param;
+		param.sched_priority = sched_get_priority_max(SCHED_FIFO) - 1;
+		pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+	}
 #endif
 
 	while (device->streaming && !device->stop_requested)
@@ -879,8 +946,8 @@ static int airspy_open_init(airspy_device_t** device, uint64_t serial_number, in
 
 	lib_device->transfers = NULL;
 	lib_device->callback = NULL;
-	lib_device->transfer_count = 16;
-	lib_device->buffer_size = 262144;
+	lib_device->transfer_count = 32;
+	lib_device->buffer_size = 524288;
 	lib_device->packing_enabled = false;
 	lib_device->streaming = false;
 	lib_device->stop_requested = false;
@@ -1932,7 +1999,7 @@ int airspy_list_devices(uint64_t *serials, int count)
 			free_transfers(device);
 
 			device->packing_enabled = packing_enabled;
-			device->buffer_size = packing_enabled ? (6144 * 24) : 262144;
+			device->buffer_size = packing_enabled ? (6144 * 64) : 524288;
 
 			result = allocate_transfers(device);
 			if (result != 0)
