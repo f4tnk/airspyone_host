@@ -267,6 +267,23 @@ static int allocate_transfers(airspy_device_t* const device)
 				return AIRSPY_ERROR_LIBUSB;
 			}
 
+#ifdef __linux__
+			{
+				void *aligned_buf = NULL;
+				if (posix_memalign(&aligned_buf, 4096, device->buffer_size) != 0)
+					aligned_buf = NULL;
+				libusb_fill_bulk_transfer(
+					device->transfers[transfer_index],
+					device->usb_device,
+					0,
+					(unsigned char*)aligned_buf,
+					device->buffer_size,
+					NULL,
+					device,
+					0
+					);
+			}
+#else
 			libusb_fill_bulk_transfer(
 				device->transfers[transfer_index],
 				device->usb_device,
@@ -277,6 +294,7 @@ static int allocate_transfers(airspy_device_t* const device)
 				device,
 				0
 				);
+#endif
 
 			if (device->transfers[transfer_index]->buffer == NULL)
 			{
@@ -410,7 +428,10 @@ static void* consumer_threadproc(void *arg)
 	{
 		struct sched_param param;
 		param.sched_priority = sched_get_priority_max(SCHED_FIFO);
-		pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+		if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) != 0)
+		{
+			fprintf(stderr, "airspy: warning: could not set SCHED_FIFO on consumer thread (need CAP_SYS_NICE)\n");
+		}
 	}
 #endif
 
@@ -565,7 +586,10 @@ static void* transfer_threadproc(void* arg)
 	{
 		struct sched_param param;
 		param.sched_priority = sched_get_priority_max(SCHED_FIFO) - 1;
-		pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+		if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) != 0)
+		{
+			fprintf(stderr, "airspy: warning: could not set SCHED_FIFO on transfer thread (need CAP_SYS_NICE)\n");
+		}
 	}
 #endif
 
