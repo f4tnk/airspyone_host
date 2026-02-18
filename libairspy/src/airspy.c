@@ -45,8 +45,17 @@ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSI
 #endif
 
 #if defined(__x86_64__) || defined(__i386__)
-#include <immintrin.h>
-#define USE_SSE2
+  #include <immintrin.h>
+  #define USE_SSE2
+  #if defined(__AVX2__)
+    #define USE_AVX2
+  #endif
+  #if defined(__FMA__)
+    #define USE_FMA3
+  #endif
+#elif defined(__ARM_NEON)
+  #include <arm_neon.h>
+  #define USE_NEON
 #endif
 
 #ifndef bool

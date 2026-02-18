@@ -49,6 +49,12 @@ void * _aligned_malloc(size_t size, size_t alignment);
   #if defined(__x86_64__) || defined(__i386__)
     #define USE_SSE2
     #include <immintrin.h>
+    #if defined(__AVX2__)
+      #define USE_AVX2
+    #endif
+  #elif defined(__ARM_NEON)
+    #define USE_NEON
+    #include <arm_neon.h>
   #endif
 #endif
 
@@ -193,7 +199,47 @@ static void translate_fs_4(iqconverter_int16_t *cnv, int16_t *samples, int len)
 {
 	int i;
 
-#ifdef USE_SSE2
+#ifdef USE_AVX2
+	/* --- AVX2 path: 16 int16 samples/iter (256-bit) --- */
+	__m256i mul_mask256  = _mm256_set_epi16(1, 1, -1, -1, 1, 1, -1, -1,  1, 1, -1, -1, 1, 1, -1, -1);
+	__m256i shift_sel256 = _mm256_set_epi16(-1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0);
+
+	for (i = 0; i + 15 < len; i += 16)
+	{
+		__m256i v = _mm256_loadu_si256((__m256i*)(samples + i));
+		v = _mm256_mullo_epi16(v, mul_mask256);
+		__m256i shifted = _mm256_srai_epi16(v, 1);
+		v = _mm256_or_si256(
+			_mm256_andnot_si256(shift_sel256, v),
+			_mm256_and_si256(shift_sel256, shifted));
+		_mm256_storeu_si256((__m256i*)(samples + i), v);
+	}
+	_mm256_zeroupper();
+
+	/* SSE2 cleanup for remaining <16 samples */
+	{
+		__m128i mul_mask8  = _mm_set_epi16(1, 1, -1, -1, 1, 1, -1, -1);
+		__m128i shift_sel8 = _mm_set_epi16(-1, 0, -1, 0, -1, 0, -1, 0);
+		for (; i + 7 < len; i += 8)
+		{
+			__m128i v8 = _mm_loadu_si128((__m128i*)(samples + i));
+			v8 = _mm_mullo_epi16(v8, mul_mask8);
+			__m128i shifted8 = _mm_srai_epi16(v8, 1);
+			v8 = _mm_or_si128(
+				_mm_andnot_si128(shift_sel8, v8),
+				_mm_and_si128(shift_sel8, shifted8));
+			_mm_storeu_si128((__m128i*)(samples + i), v8);
+		}
+	}
+	for (; i < len; i += 4)
+	{
+		samples[i + 0] = -samples[i + 0];
+		samples[i + 1] = -samples[i + 1] >> 1;
+		//samples[i + 2] = samples[i + 2];
+		samples[i + 3] = samples[i + 3] >> 1;
+	}
+
+#elif defined(USE_SSE2)
 	__m128i mul_mask = _mm_set_epi16(1, 1, -1, -1, 1, 1, -1, -1);
 	__m128i shift_sel = _mm_set_epi16(-1, 0, -1, 0, -1, 0, -1, 0);
 

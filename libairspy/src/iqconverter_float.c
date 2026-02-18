@@ -45,6 +45,15 @@ THE SOFTWARE, PROVIDED SUCH USE REMAINS WITHIN THE AIRSPY ECOSYSTEM.
   #if defined(__x86_64__) || defined(__i386__)
     #define USE_SSE2
     #include <immintrin.h>
+    #if defined(__AVX2__)
+      #define USE_AVX2
+    #endif
+    #if defined(__FMA__)
+      #define USE_FMA3
+    #endif
+  #elif defined(__ARM_NEON)
+    #define USE_NEON
+    #include <arm_neon.h>
   #endif
   #define _inline inline
   #define _aligned_free(mem) free(mem)
@@ -63,6 +72,15 @@ void *_aligned_malloc(size_t size, size_t alignment)
   #if defined(__x86_64__) || defined(__i386__)
     #define USE_SSE2
     #include <immintrin.h>
+    #if defined(__AVX2__)
+      #define USE_AVX2
+    #endif
+    #if defined(__FMA__)
+      #define USE_FMA3
+    #endif
+  #elif defined(__ARM_NEON)
+    #define USE_NEON
+    #include <arm_neon.h>
   #endif
 #else
 	#if (_MSC_VER >= 1800)
@@ -127,42 +145,132 @@ static _inline float process_fir_taps(const float *kernel, const float *queue, i
 {
 	int i;
 
-#ifdef USE_SSE2
+#ifdef USE_AVX2
 
-	__m128 acc = _mm_set_ps(0, 0, 0, 0);
+	/* --- AVX2 path: 16 floats/iter with optional FMA3 + prefetch --- */
+	__m256 acc256 = _mm256_setzero_ps();
+	_mm_prefetch((const char *)kernel, _MM_HINT_T0);
+	_mm_prefetch((const char *)queue,  _MM_HINT_T0);
 
+	if (len >= 16)
+	{
+		int it = len >> 4;
+		for (i = 0; i < it; i++)
+		{
+			_mm_prefetch((const char *)(kernel + 16), _MM_HINT_T0);
+			_mm_prefetch((const char *)(queue  + 16), _MM_HINT_T0);
+#ifdef USE_FMA3
+			acc256 = _mm256_fmadd_ps(_mm256_loadu_ps(kernel),     _mm256_loadu_ps(queue),     acc256);
+			acc256 = _mm256_fmadd_ps(_mm256_loadu_ps(kernel + 8), _mm256_loadu_ps(queue + 8), acc256);
 #else
-
-	float sum = 0.0f;
-
+			acc256 = _mm256_add_ps(acc256,
+				_mm256_add_ps(
+					_mm256_mul_ps(_mm256_loadu_ps(kernel),     _mm256_loadu_ps(queue)),
+					_mm256_mul_ps(_mm256_loadu_ps(kernel + 8), _mm256_loadu_ps(queue + 8))));
 #endif
+			kernel += 16;
+			queue  += 16;
+		}
+		len &= 15;
+	}
+
+	/* Horizontal reduce __m256 → __m128 */
+	__m128 acc = _mm_add_ps(
+		_mm256_extractf128_ps(acc256, 0),
+		_mm256_extractf128_ps(acc256, 1));
+	_mm256_zeroupper();
+
+	/* SSE2 cleanup for remaining <16 samples */
+	if (len >= 8)
+	{
+		__m128 h1 = _mm_loadu_ps(queue);
+		__m128 k1 = _mm_load_ps(kernel);
+		__m128 h2 = _mm_loadu_ps(queue + 4);
+		__m128 k2 = _mm_load_ps(kernel + 4);
+		acc = _mm_add_ps(acc, _mm_add_ps(_mm_mul_ps(k1, h1), _mm_mul_ps(k2, h2)));
+		queue += 8; kernel += 8; len -= 8;
+	}
+	if (len >= 4)
+	{
+		__m128 head = _mm_loadu_ps(queue);
+		__m128 kern = _mm_load_ps(kernel);
+		acc = _mm_add_ps(acc, _mm_mul_ps(kern, head));
+		kernel += 4; queue += 4; len &= 3;
+	}
+
+	__m128 t = _mm_add_ps(acc, _mm_movehl_ps(acc, acc));
+	acc = _mm_add_ss(t, _mm_shuffle_ps(t, t, 1));
+	float sum = _mm_cvtss_f32(acc);
+
+#elif defined(USE_NEON)
+
+	/* --- ARM NEON path: 8 floats/iter with vmlaq_f32 --- */
+	float32x4_t acc_n = vdupq_n_f32(0.0f);
 
 	if (len >= 8)
 	{
 		int it = len >> 3;
+		for (i = 0; i < it; i++)
+		{
+			acc_n = vmlaq_f32(acc_n, vld1q_f32(kernel),     vld1q_f32(queue));
+			acc_n = vmlaq_f32(acc_n, vld1q_f32(kernel + 4), vld1q_f32(queue + 4));
+			kernel += 8;
+			queue  += 8;
+		}
+		len &= 7;
+	}
+	if (len >= 4)
+	{
+		acc_n = vmlaq_f32(acc_n, vld1q_f32(kernel), vld1q_f32(queue));
+		kernel += 4; queue += 4; len &= 3;
+	}
 
-#ifdef USE_SSE2
+	float32x2_t s2 = vadd_f32(vget_low_f32(acc_n), vget_high_f32(acc_n));
+	s2 = vpadd_f32(s2, s2);
+	float sum = vget_lane_f32(s2, 0);
 
+#elif defined(USE_SSE2)
+
+	/* --- SSE2 path: 8 floats/iter --- */
+	__m128 acc = _mm_set_ps(0, 0, 0, 0);
+
+	if (len >= 8)
+	{
+		int it = len >> 3;
 		for (i = 0; i < it; i++)
 		{
 			__m128 head1 = _mm_loadu_ps(queue);
 			__m128 kern1 = _mm_load_ps(kernel);
 			__m128 head2 = _mm_loadu_ps(queue + 4);
 			__m128 kern2 = _mm_load_ps(kernel + 4);
-
-			__m128 mul1 = _mm_mul_ps(kern1, head1);
-			__m128 mul2 = _mm_mul_ps(kern2, head2);
-
-			mul1 = _mm_add_ps(mul1, mul2);
-
-			acc = _mm_add_ps(acc, mul1);
-
-			queue += 8;
+			__m128 mul1  = _mm_mul_ps(kern1, head1);
+			__m128 mul2  = _mm_mul_ps(kern2, head2);
+			acc = _mm_add_ps(acc, _mm_add_ps(mul1, mul2));
+			queue  += 8;
 			kernel += 8;
 		}
+		len &= 7;
+	}
+	if (len >= 4)
+	{
+		__m128 head = _mm_loadu_ps(queue);
+		__m128 kern = _mm_load_ps(kernel);
+		acc = _mm_add_ps(acc, _mm_mul_ps(kern, head));
+		kernel += 4; queue += 4; len &= 3;
+	}
+
+	__m128 t = _mm_add_ps(acc, _mm_movehl_ps(acc, acc));
+	acc = _mm_add_ss(t, _mm_shuffle_ps(t, t, 1));
+	float sum = _mm_cvtss_f32(acc);
 
 #else
 
+	/* --- Scalar fallback --- */
+	float sum = 0.0f;
+
+	if (len >= 8)
+	{
+		int it = len >> 3;
 		for (i = 0; i < it; i++)
 		{
 			sum += kernel[0] * queue[0]
@@ -173,45 +281,19 @@ static _inline float process_fir_taps(const float *kernel, const float *queue, i
 				+ kernel[5] * queue[5]
 				+ kernel[6] * queue[6]
 				+ kernel[7] * queue[7];
-
-			queue += 8;
+			queue  += 8;
 			kernel += 8;
 		}
-
-#endif
 		len &= 7;
 	}
-
 	if (len >= 4)
 	{
-
-#ifdef USE_SSE2
-
-		__m128 head = _mm_loadu_ps(queue);
-		__m128 kern = _mm_load_ps(kernel);
-		__m128 mul = _mm_mul_ps(kern, head);
-		acc = _mm_add_ps(acc, mul);
-
-#else
-
 		sum += kernel[0] * queue[0]
 			+ kernel[1] * queue[1]
 			+ kernel[2] * queue[2]
 			+ kernel[3] * queue[3];
-
-#endif
-
-		kernel += 4;
-		queue += 4;
-		len &= 3;
+		kernel += 4; queue += 4; len &= 3;
 	}
-
-#ifdef USE_SSE2
-
-	__m128 t = _mm_add_ps(acc, _mm_movehl_ps(acc, acc));
-	acc = _mm_add_ss(t, _mm_shuffle_ps(t, t, 1));
-
-	float sum = _mm_cvtss_f32(acc);
 
 #endif
 
@@ -219,16 +301,7 @@ static _inline float process_fir_taps(const float *kernel, const float *queue, i
 	{
 		sum += kernel[0] * queue[0]
 			+ kernel[1] * queue[1];
-
-		//kernel += 2;
-		//queue += 2;
-		//len &= 1;
 	}
-
-	//if (len >= 1)
-	//{
-	//	sum += kernel[0] * queue[0];
-	//}
 
 	return sum;
 }
@@ -498,13 +571,45 @@ static void translate_fs_4(iqconverter_float_t *cnv, float *samples, int len)
 	int i;
 	ALIGNED float hbc = cnv->hbc;
 
-#ifdef USE_SSE2
+#ifdef USE_AVX2
 
+	/* --- AVX2 path: 8 samples/iter (256-bit) --- */
+	float *buf = samples;
+	__m256 rot8 = _mm256_set_ps(hbc, 1.0f, -hbc, -1.0f, hbc, 1.0f, -hbc, -1.0f);
+
+	for (i = 0; i < len / 8; i++, buf += 8)
+	{
+		__m256 vec = _mm256_loadu_ps(buf);
+		_mm256_storeu_ps(buf, _mm256_mul_ps(vec, rot8));
+	}
+
+	/* Handle remaining 4 samples if len is not a multiple of 8 */
+	if ((len % 8) >= 4)
+	{
+		__m128 rot4 = _mm_set_ps(hbc, 1.0f, -hbc, -1.0f);
+		_mm_storeu_ps(buf, _mm_mul_ps(_mm_loadu_ps(buf), rot4));
+	}
+	_mm256_zeroupper();
+
+#elif defined(USE_NEON)
+
+	/* --- ARM NEON path: 4 samples/iter --- */
+	float *buf = samples;
+	const float32x4_t rot4 = { -1.0f, -hbc, 1.0f, hbc };
+
+	for (i = 0; i < len / 4; i++, buf += 4)
+	{
+		vst1q_f32(buf, vmulq_f32(vld1q_f32(buf), rot4));
+	}
+
+#elif defined(USE_SSE2)
+
+	/* --- SSE2 path: 4 samples/iter (128-bit) --- */
 	float *buf = samples;
 	ALIGNED __m128 vec;
 	ALIGNED __m128 rot = _mm_set_ps(hbc, 1.0f, -hbc, -1.0f);
 
-	for (i = 0; i < len / 4; i++, buf +=4)
+	for (i = 0; i < len / 4; i++, buf += 4)
 	{
 		vec = _mm_loadu_ps(buf);
 		vec = _mm_mul_ps(vec, rot);
@@ -513,6 +618,7 @@ static void translate_fs_4(iqconverter_float_t *cnv, float *samples, int len)
 
 #else
 
+	/* --- Scalar fallback --- */
 	int j;
 
 	for (i = 0; i < len / 4; i++)

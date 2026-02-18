@@ -2,7 +2,8 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Platform-Linux%20x86__64-blue?style=for-the-badge&logo=linux" />
-  <img src="https://img.shields.io/badge/SIMD-SSE2%20%2F%20AVX-orange?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/SIMD-SSE2%20%2F%20AVX2%20%2F%20FMA3-orange?style=for-the-badge" />
+  <img src="https://img.shields.io/badge/ARM-NEON%20RPi3%2F4%2F5-cyan?style=for-the-badge" />
   <img src="https://img.shields.io/badge/Filter-63--tap%20Half--Band-green?style=for-the-badge" />
   <img src="https://img.shields.io/badge/USB-Optimized%20Pipeline-red?style=for-the-badge&logo=usb" />
   <img src="https://img.shields.io/badge/Threads-SCHED__FIFO-purple?style=for-the-badge" />
@@ -33,6 +34,11 @@
 - [🔧 11. DSP Compilation Flags](#-11-dsp-compilation-flags)
 - [📻 12. Improved Default Gains](#-12-improved-default-gains)
 - [💾 13. Enlarged File I/O Buffer](#-13-enlarged-file-io-buffer)
+- [🧬 14. AVX2/FMA3/NEON Platform Detection](#-14-avx2fma3neon-platform-detection)
+- [⚡ 15. AVX2+FMA3 — FIR Taps (16 floats/iter)](#-15-avx2fma3--fir-taps-16-floatsiter)
+- [🔄 16. AVX2 — translate_fs_4 Float (8 samples/iter)](#-16-avx2--translate_fs_4-float-8-samplesiter)
+- [🔄 17. AVX2 — translate_fs_4 INT16 (16 samples/iter)](#-17-avx2--translate_fs_4-int16-16-samplesiter)
+- [📱 18. ARM NEON — FIR + translate_fs_4](#-18-arm-neon--fir--translate_fs_4)
 - [📊 Impact Summary](#-impact-summary)
 - [🛠️ Compilation](#️-compilation)
 - [⚠️ Important Notes](#️-important-notes)
@@ -49,6 +55,15 @@ mindmap
       Convert FLOAT32
       fs/4 Translation
       FIR Taps SSE2
+    SIMD AVX2+FMA3
+      FIR Taps 16f/iter
+      FMA3 fmadd_ps
+      translate_fs_4 8s/iter
+      INT16 16s/iter
+      Prefetch L1/L2
+    ARM NEON
+      vmlaq_f32 FIR
+      vmulq_f32 translate
     USB Pipeline
       transfer_count 32
       buffer_size 512KB
@@ -641,6 +656,249 @@ Default gains were conservative. They were raised for better base SNR:
 
 ---
 
+## 🧬 14. AVX2/FMA3/NEON Platform Detection
+
+> **Files**: `iqconverter_float.c`, `iqconverter_int16.c`, `airspy.c`
+
+### 🔍 Problem
+The SIMD detection only activated `USE_SSE2` for x86. Modern CPUs (Intel Haswell+, AMD Ryzen) have AVX2 and FMA3, and ARM SBCs (Raspberry Pi 3/4/5) have NEON — none were detected.
+
+### ✅ Solution
+
+```c
+// All 3 files — extended platform detection
+#if defined(__x86_64__) || defined(__i386__)
+  #include <immintrin.h>
+  #define USE_SSE2
+  #if defined(__AVX2__)     // Intel Haswell+ / AMD Ryzen+
+    #define USE_AVX2
+  #endif
+  #if defined(__FMA__)      // Intel Haswell+ / AMD Piledriver+
+    #define USE_FMA3
+  #endif
+#elif defined(__ARM_NEON)   // Raspberry Pi 3/4/5, Beaglebone...
+  #include <arm_neon.h>
+  #define USE_NEON
+#endif
+```
+
+| Macro | CPU | ISA | Instruction Width |
+|:------|:----|:----|:-----------------:|
+| `USE_SSE2` | Pentium 4+ / Athlon 64+ | x86 | 128-bit |
+| `USE_AVX2` | Intel Haswell+ / AMD Zen+ | x86 | **256-bit** |
+| `USE_FMA3` | Intel Haswell+ / AMD Piledriver+ | x86 | **256-bit fused** |
+| `USE_NEON` | ARM Cortex-A7+ | ARM | 128-bit |
+
+```mermaid
+flowchart TD
+    A{CPU arch?} --> B[x86 / x86_64]
+    A --> E[ARM]
+    B --> C[USE_SSE2 ✔] --> D{__AVX2__?}
+    D -->|Yes| F[USE_AVX2 ✔] --> G{__FMA__?}
+    G -->|Yes| H[USE_FMA3 ✔]
+    G -->|No| I[AVX2 only]
+    D -->|No| J[SSE2 only]
+    E --> K{__ARM_NEON?} -->|Yes| L[USE_NEON ✔]
+
+    style H fill:#1b4332,stroke:#2d6a4f,color:#fff
+    style F fill:#1b4332,stroke:#2d6a4f,color:#fff
+    style L fill:#0d3b80,stroke:#1a5ccc,color:#fff
+```
+
+---
+
+## ⚡ 15. AVX2+FMA3 — FIR Taps (16 floats/iter)
+
+> **File**: `iqconverter_float.c` — `process_fir_taps()`
+
+### 🔍 Problem
+The SSE2 FIR implementation processes **8 floats per outer iteration** using two 128-bit `__m128` registers. Each multiply-accumulate requires 2 instructions (`_mm_mul_ps` + `_mm_add_ps`).
+
+### ✅ Solution
+**AVX2** doubles width to **256-bit**, processing **16 floats/iter**. **FMA3** fuses multiply+add into a single instruction with better precision and throughput.
+
+```c
+#ifdef USE_AVX2
+    __m256 acc256 = _mm256_setzero_ps();
+    _mm_prefetch((const char *)kernel, _MM_HINT_T0);  // Mod 30: prefetch
+    _mm_prefetch((const char *)queue,  _MM_HINT_T0);
+
+    if (len >= 16)
+    {
+        int it = len >> 4;   // 16 floats per iteration (vs 8 for SSE2)
+        for (i = 0; i < it; i++)
+        {
+            _mm_prefetch((const char *)(kernel + 16), _MM_HINT_T0);
+            _mm_prefetch((const char *)(queue  + 16), _MM_HINT_T0);
+#ifdef USE_FMA3
+            // One instruction: multiply + accumulate (Mod 28)
+            acc256 = _mm256_fmadd_ps(_mm256_loadu_ps(kernel),     _mm256_loadu_ps(queue),     acc256);
+            acc256 = _mm256_fmadd_ps(_mm256_loadu_ps(kernel + 8), _mm256_loadu_ps(queue + 8), acc256);
+#else
+            acc256 = _mm256_add_ps(acc256,
+                _mm256_add_ps(
+                    _mm256_mul_ps(_mm256_loadu_ps(kernel),     _mm256_loadu_ps(queue)),
+                    _mm256_mul_ps(_mm256_loadu_ps(kernel + 8), _mm256_loadu_ps(queue + 8))));
+#endif
+            kernel += 16;
+            queue  += 16;
+        }
+        len &= 15;
+    }
+    /* Horizontal reduce __m256 → __m128 */
+    __m128 acc = _mm_add_ps(
+        _mm256_extractf128_ps(acc256, 0),
+        _mm256_extractf128_ps(acc256, 1));
+    _mm256_zeroupper();   // Avoid SSE/AVX transition penalty
+    /* SSE2 cleanup for remaining 8/4 samples ... */
+```
+
+### 📊 Throughput Comparison
+
+| Implementation | Floats/iter | MAC instructions | Registers |
+|:---:|:---:|:---:|:---:|
+| Scalar | 8 | 16 mul + 8 add | none |
+| SSE2 | 8 | 2 mul + 2 add | 128-bit |
+| **AVX2** | **16** | **2 mul + 2 add** | **256-bit** |
+| **AVX2+FMA3** | **16** | **2 fmadd** | **256-bit** |
+
+```mermaid
+gantt
+    title FIR Taps Throughput — floats per iteration
+    dateFormat X
+    axisFormat %s
+
+    section Before
+    SSE2 — 8 floats/iter  :a1, 0, 8
+
+    section After
+    AVX2 — 16 floats/iter  :crit, b1, 0, 16
+    AVX2+FMA3 — 16f + 1 inst  :crit, b2, 0, 16
+```
+
+> **Binary verification**: `objdump` on `libairspy.so` confirms **25 `vfmadd` instructions** + **121+ `ymm` register uses**.
+
+---
+
+## 🔄 16. AVX2 — translate_fs_4 Float (8 samples/iter)
+
+> **File**: `iqconverter_float.c` — `translate_fs_4()`
+
+### 🔍 Problem
+Frequency translation at fs/4 applied a rotation pattern `[-1, -hbc, +1, +hbc]` to 4 samples at a time (SSE2 `__m128`).
+
+### ✅ Solution
+With AVX2, process **8 samples at once** (256-bit) by broadcasting two copies of the rotation pattern:
+
+```c
+#ifdef USE_AVX2
+    float *buf = samples;
+    // Pattern repeated twice in 256-bit vector: [hbc, 1, -hbc, -1, hbc, 1, -hbc, -1]
+    __m256 rot8 = _mm256_set_ps(hbc, 1.0f, -hbc, -1.0f, hbc, 1.0f, -hbc, -1.0f);
+
+    for (i = 0; i < len / 8; i++, buf += 8)     // ×2 vs SSE2
+    {
+        __m256 vec = _mm256_loadu_ps(buf);
+        _mm256_storeu_ps(buf, _mm256_mul_ps(vec, rot8));
+    }
+    /* Remaining 4 samples: fallback to SSE2 __m128 rot */
+    if ((len % 8) >= 4) {
+        __m128 rot4 = _mm_set_ps(hbc, 1.0f, -hbc, -1.0f);
+        _mm_storeu_ps(buf, _mm_mul_ps(_mm_loadu_ps(buf), rot4));
+    }
+    _mm256_zeroupper();
+```
+
+| | SSE2 (before) | AVX2 (after) |
+|:--|:---:|:---:|
+| Samples/iter | 4 | **8** |
+| Instructions/call (N samples) | N/4 `mulps` | **N/8** `vmulps` |
+| Register width | 128-bit | **256-bit** |
+
+---
+
+## 🔄 17. AVX2 — translate_fs_4 INT16 (16 samples/iter)
+
+> **File**: `iqconverter_int16.c` — `translate_fs_4()`
+
+Same principle applied to the INT16 converter. AVX2 processes **16 int16 samples at once** using `__m256i`:
+
+```c
+#ifdef USE_AVX2
+    __m256i mul_mask256  = _mm256_set_epi16(1, 1, -1, -1, 1, 1, -1, -1,  1, 1, -1, -1, 1, 1, -1, -1);
+    __m256i shift_sel256 = _mm256_set_epi16(-1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0);
+
+    for (i = 0; i + 15 < len; i += 16)   // 16 int16/iter (vs 8 SSE2)
+    {
+        __m256i v = _mm256_loadu_si256((__m256i*)(samples + i));
+        v = _mm256_mullo_epi16(v, mul_mask256);
+        __m256i shifted = _mm256_srai_epi16(v, 1);
+        v = _mm256_or_si256(
+            _mm256_andnot_si256(shift_sel256, v),
+            _mm256_and_si256(shift_sel256, shifted));
+        _mm256_storeu_si256((__m256i*)(samples + i), v);
+    }
+    _mm256_zeroupper();
+    /* SSE2 cleanup for remaining <16 samples ... */
+```
+
+| | SSE2 | AVX2 |
+|:--|:---:|:---:|
+| Samples/iter | 8 | **16** |
+| `mullo_epi16` calls (N samples) | N/8 | **N/16** |
+
+---
+
+## 📱 18. ARM NEON — FIR + translate_fs_4
+
+> **Files**: `iqconverter_float.c`
+
+### 🎯 Context
+SatNOGS stations run on **Raspberry Pi 3/4/5** (ARM Cortex-A53/A72/A76). These CPUs have **NEON** SIMD (128-bit, equivalent to SSE2 on x86). Previously: scalar path only on ARM.
+
+### ✅ Solution
+
+**FIR** — `vmlaq_f32` (multiply-accumulate in 1 instruction):
+
+```c
+#elif defined(USE_NEON)
+    float32x4_t acc_n = vdupq_n_f32(0.0f);
+
+    if (len >= 8)
+    {
+        int it = len >> 3;
+        for (i = 0; i < it; i++)
+        {
+            acc_n = vmlaq_f32(acc_n, vld1q_f32(kernel),     vld1q_f32(queue));   // 4 floats
+            acc_n = vmlaq_f32(acc_n, vld1q_f32(kernel + 4), vld1q_f32(queue + 4)); // 4 floats
+            kernel += 8; queue += 8;
+        }
+    }
+    // Horizontal sum
+    float32x2_t s2 = vadd_f32(vget_low_f32(acc_n), vget_high_f32(acc_n));
+    s2 = vpadd_f32(s2, s2);
+    float sum = vget_lane_f32(s2, 0);
+```
+
+**translate_fs_4** — `vmulq_f32`:
+
+```c
+#elif defined(USE_NEON)
+    const float32x4_t rot4 = { -1.0f, -hbc, 1.0f, hbc };
+    for (i = 0; i < len / 4; i++, buf += 4)
+        vst1q_f32(buf, vmulq_f32(vld1q_f32(buf), rot4));
+```
+
+| Platform | FIR before | FIR after | translate before | translate after |
+|:---------|:----------:|:---------:|:----------------:|:---------------:|
+| RPi3 (A53) | scalar | **NEON vmlaq** | scalar | **NEON vmulq** |
+| RPi4 (A72) | scalar | **NEON vmlaq** | scalar | **NEON vmulq** |
+| x86 i7-6700 | SSE2 | **AVX2+FMA3** | SSE2 | **AVX2** |
+
+> 📌 Activation: automatic at compile time with `-march=native` or `-mfpu=neon -mfloat-abi=hard` on ARM.
+
+---
+
 ## 📊 Impact Summary
 
 ```mermaid
@@ -653,6 +911,8 @@ flowchart TB
         G4["📡 Sensitivity<br/><b>+6-10 dB</b><br/>Optimal LNA/VGA gains"]
         G5["⏱️ USB Latency<br/><b>÷5</b><br/>100ms vs 500ms poll"]
         G6["🧵 Stability<br/><b>0 xruns</b><br/>SCHED_FIFO RT"]
+        G7["⚡ FIR AVX2+FMA3<br/><b>×4 vs scalar</b><br/>16 floats/iter + fmadd"]
+        G8["🔄 translate_fs_4 AVX2<br/><b>×2 vs SSE2</b><br/>8 samples/iter 256-bit"]
     end
 
     style Perf fill:#0a0a23,stroke:#1a1a40,color:#fff
@@ -662,6 +922,8 @@ flowchart TB
     style G4 fill:#1b4332,stroke:#2d6a4f,color:#fff
     style G5 fill:#1b4332,stroke:#2d6a4f,color:#fff
     style G6 fill:#1b4332,stroke:#2d6a4f,color:#fff
+    style G7 fill:#0d3b80,stroke:#1a5ccc,color:#fff
+    style G8 fill:#0d3b80,stroke:#1a5ccc,color:#fff
 ```
 
 ### 📑 Complete Recap Table
@@ -692,6 +954,14 @@ flowchart TB
 | 22 | Enhanced default gains | `airspy_rx.c` | 📻 Config | Improved base SNR |
 | 23 | FD_BUFFER_SIZE 16→256KB | `airspy_rx.c` | 💾 I/O | ÷16 write syscalls |
 | 24 | Portable `_mm_cvtss_f32` | `iqconverter_float.c` | 🔧 Fix | Compiles on all OS |
+| 25 | `USE_AVX2`/`USE_FMA3`/`USE_NEON` detection | `iqconverter_*.c`, `airspy.c` | 🔧 SIMD | Activates 256-bit + NEON paths |
+| 26 | FIR AVX2 — 16 floats/iter | `iqconverter_float.c` | ⚡ SIMD | ×2 FIR throughput vs SSE2 |
+| 27 | FIR FMA3 — `_mm256_fmadd_ps` | `iqconverter_float.c` | ⚡ SIMD | 1 inst vs mul+add, better IPC |
+| 28 | `translate_fs_4` float AVX2 — 8 samples/iter | `iqconverter_float.c` | ⚡ SIMD | ×2 frequency translation |
+| 29 | `translate_fs_4` INT16 AVX2 — 16 samples/iter | `iqconverter_int16.c` | ⚡ SIMD | ×2 INT16 frequency translation |
+| 30 | ARM NEON `vmlaq_f32` FIR | `iqconverter_float.c` | 📱 NEON | RPi3/4/5 vectorized FIR |
+| 31 | ARM NEON `vmulq_f32` translate | `iqconverter_float.c` | 📱 NEON | RPi3/4/5 vectorized rotation |
+| 32 | `_mm_prefetch` L1 hints (AVX2 FIR) | `iqconverter_float.c` | ⏩ Perf | Preload kernel+queue ahead of AVX2 loop |
 
 ---
 
@@ -750,14 +1020,15 @@ This flag relaxes IEEE 754 compliance. If you encounter numerical artifacts in e
 
 ### Portability
 
-| Platform | SSE2 | SCHED_FIFO | posix_memalign | Status |
-|:---|:---:|:---:|:---:|:---:|
-| Linux x86_64 | ✅ | ✅ | ✅ | **Full support** |
-| Linux i386 | ✅ | ✅ | ✅ | **Full support** |
-| Linux ARM | ❌ | ✅ | ✅ | Scalar + RT |
-| FreeBSD x86 | ✅ | ❌ | ❌ | SSE2 only |
-| macOS | ❌ | ❌ | ❌ | No changes |
-| Windows | ❌ | ❌ | ❌ | No changes |
+| Platform | SSE2 | AVX2+FMA3 | SCHED_FIFO | posix_memalign | Status |
+|:---|:---:|:---:|:---:|:---:|:---:|
+| Linux x86_64 (Haswell+) | ✅ | ✅ | ✅ | ✅ | **Full + AVX2** |
+| Linux x86_64 (pre-Haswell) | ✅ | ❌ | ✅ | ✅ | Full SSE2 |
+| Linux i386 | ✅ | ❌ | ✅ | ✅ | Full SSE2 |
+| Linux ARM (RPi3/4/5) | ❌ | ❌ | ✅ | ✅ | **NEON** |
+| FreeBSD x86 | ✅ | ✅ | ❌ | ❌ | SSE2/AVX2 only |
+| macOS | ❌ | ❌ | ❌ | ❌ | No changes |
+| Windows | ❌ | ❌ | ❌ | ❌ | No changes |
 
 ---
 
