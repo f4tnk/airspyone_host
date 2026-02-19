@@ -1022,6 +1022,19 @@ static int airspy_open_init(airspy_device_t** device, uint64_t serial_number, in
 	pthread_cond_init(&lib_device->consumer_cv, NULL);
 	pthread_mutex_init(&lib_device->consumer_mp, NULL);
 
+	/* Log USB transfer configuration and supported sample rates */
+	{
+		uint32_t i;
+		fprintf(stderr, "airspy: opened — %u USB transfers \u00d7 %u bytes (%u KB total), %u raw ring buffers\n",
+			lib_device->transfer_count, lib_device->buffer_size,
+			(lib_device->transfer_count * lib_device->buffer_size) / 1024,
+			RAW_BUFFER_COUNT);
+		fprintf(stderr, "airspy: supported sample rates:");
+		for (i = 0; i < lib_device->supported_samplerate_count; i++)
+			fprintf(stderr, " %u", lib_device->supported_samplerates[i]);
+		fprintf(stderr, "\n");
+	}
+
 	*device = lib_device;
 
 	return AIRSPY_SUCCESS;
@@ -1324,6 +1337,9 @@ int airspy_list_devices(uint64_t *serials, int count)
 		device->stop_requested = true;
 		result1 = airspy_set_receiver_mode(device, RECEIVER_MODE_OFF);
 		result2 = kill_io_threads(device);
+
+		if (device->dropped_buffers > 0)
+			fprintf(stderr, "airspy: session ended — %u USB buffer drop(s)\n", device->dropped_buffers);
 
 		if (result1 != AIRSPY_SUCCESS)
 		{
