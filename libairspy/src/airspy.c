@@ -66,7 +66,11 @@ typedef int bool;
 
 #define PACKET_SIZE (12)
 #define UNPACKED_SIZE (16)
-#define RAW_BUFFER_COUNT (16)
+// F4TNK: Increased from 16 to 32 to absorb consumer thread jitter.
+// At 10 MSPS packed, each buffer ≈26 ms → 32 buffers = ~832 ms headroom
+// before the libusb callback drops buffers (dropped_buffers++).
+// Must be a power of 2 (used with & mask in queue head/tail).
+#define RAW_BUFFER_COUNT (32)
 
 #ifdef AIRSPY_BIG_ENDIAN
 #define TO_LE(x) __builtin_bswap32(x)
