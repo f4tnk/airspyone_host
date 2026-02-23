@@ -28,6 +28,7 @@
 - [🧹 5. Optimized DC Removal](#-5-optimized-dc-removal)
 - [🔌 6. Optimized USB Pipeline](#-6-optimized-usb-pipeline)
 - [🧵 7. Real-time Thread Priorities](#-7-real-time-thread-priorities)
+- [🗂️ 19. RAW\_BUFFER\_COUNT 16→32 — Priority Inversion Fix](#-19-raw_buffer_count-1632--priority-inversion-fix)
 - [📦 8. Memory Alignment for AVX](#-8-memory-alignment-for-avx)
 - [📐 9. Page-aligned Buffers (DMA)](#-9-page-aligned-buffers-dma)
 - [📤 10. Optimized Unpacking (12-bit Packed)](#-10-optimized-unpacking-12-bit-packed)
@@ -395,7 +396,7 @@ flowchart LR
 |:---|:---:|:---:|:---|
 | `transfer_count` | 16 | **32** | More USB requests in flight |
 | `buffer_size` | 256 KB | **512 KB** | Larger blocks, less overhead |
-| `RAW_BUFFER_COUNT` | 8 | **16** | Producer-consumer queue doubled |
+| `RAW_BUFFER_COUNT` | 8 | ~~16~~ → **32** | Producer-consumer queue ×4 (see §19) |
 | USB poll timeout | 500 ms | **100 ms** | 5× better responsiveness |
 | Packing buffer | 6144 × 24 | **6144 × 64** | More unpacking headroom |
 
@@ -408,7 +409,7 @@ flowchart TB
 
     subgraph After["USB Pipeline — After"]
         direction LR
-        VA["32 transfers"] --> VB["512KB each"] --> VC["16 buffers queue"] --> VD["100ms poll"]
+        VA["32 transfers"] --> VB["512KB each"] --> VC["32 buffers queue"] --> VD["100ms poll"]
     end
 
     Before -->|"🔧 Optimized"| After
@@ -913,6 +914,7 @@ flowchart TB
         G6["🧵 Stability<br/><b>0 xruns</b><br/>SCHED_FIFO RT"]
         G7["⚡ FIR AVX2+FMA3<br/><b>×4 vs scalar</b><br/>16 floats/iter + fmadd"]
         G8["🔄 translate_fs_4 AVX2<br/><b>×2 vs SSE2</b><br/>8 samples/iter 256-bit"]
+        G9["📦 RAW_BUFFER 16→32<br/><b>0 USB drops</b><br/>832ms headroom"]
     end
 
     style Perf fill:#0a0a23,stroke:#1a1a40,color:#fff
@@ -924,6 +926,7 @@ flowchart TB
     style G6 fill:#1b4332,stroke:#2d6a4f,color:#fff
     style G7 fill:#0d3b80,stroke:#1a5ccc,color:#fff
     style G8 fill:#0d3b80,stroke:#1a5ccc,color:#fff
+    style G9 fill:#6a0572,stroke:#9b59b6,color:#fff
 ```
 
 ### 📑 Complete Recap Table
@@ -939,7 +942,7 @@ flowchart TB
 | 7 | Tighter DC removal | `iqconverter_*.c` | 📡 Quality | Better DC offset suppression |
 | 8 | `transfer_count` 16→32 | `airspy.c` | 🔌 USB | ×2 USB requests in flight |
 | 9 | `buffer_size` 256→512KB | `airspy.c` | 🔌 USB | Larger blocks, less overhead |
-| 10 | `RAW_BUFFER_COUNT` 8→16 | `airspy.c` | 🔌 USB | Doubled producer-consumer queue |
+| 10 | `RAW_BUFFER_COUNT` 8→16 | `airspy.c` | 🔌 USB | Doubled producer-consumer queue (see opt 33 / §19 for 16→32) |
 | 11 | USB poll 500→100ms | `airspy.c` | ⏱️ Latency | ×5 responsiveness |
 | 12 | `posix_memalign` 4096 (USB) | `airspy.c` | 💾 Memory | DMA-friendly, zero kernel copy |
 | 13 | `posix_memalign` 64 (output) | `airspy.c` | 💾 Memory | Cache-line aligned |
@@ -962,6 +965,67 @@ flowchart TB
 | 30 | ARM NEON `vmlaq_f32` FIR | `iqconverter_float.c` | 📱 NEON | RPi3/4/5 vectorized FIR |
 | 31 | ARM NEON `vmulq_f32` translate | `iqconverter_float.c` | 📱 NEON | RPi3/4/5 vectorized rotation |
 | 32 | `_mm_prefetch` L1 hints (AVX2 FIR) | `iqconverter_float.c` | ⏩ Perf | Preload kernel+queue ahead of AVX2 loop |
+| 33 | `RAW_BUFFER_COUNT` 16→32 | `airspy.c` | 🔌 USB | ~832ms headroom vs priority-inversion stalls |
+
+---
+
+## 🗂️ 19. RAW\_BUFFER\_COUNT 16→32 — Priority Inversion Fix
+
+> **File**: `airspy.c` — `#define RAW_BUFFER_COUNT`
+
+### 📋 Root Cause
+
+Despite prior optimizations (32 libusb transfers, 512 KB buffers), occasional USB overflows
+persisted on SatNOGS station #3762 (WSL2, Intel i7-6700). Analysis revealed a **priority
+inversion** at the junction between the libairspy consumer and the GNU Radio readStream
+consumer:
+
+```
+Producer side (fills ring):                Consumer side (drains ring):
+──────────────────────────                 ──────────────────────────
+ libairspy transfer thread                  GNU Radio readStream()
+ SCHED_FIFO priority 98   ──┐         ┌── SCHED_OTHER priority 0
+ libairspy consumer thread  │  RING   │
+ SCHED_FIFO priority 99   ──┘ BUFFER └── Can be preempted for >1 s
+                                          by CFS workloads (gr-satellites,
+                                          waterfall PNG, IQ dump writes)
+```
+
+With `RAW_BUFFER_COUNT = 16`, each packed USB buffer ≈ 26 ms:
+- 16 buffers × 26 ms = **416 ms** headroom before `dropped_buffers++`
+- WSL2 USB/IP jitter + GR scheduler stalls can easily exceed 416 ms
+
+### ✅ Solution
+
+Double `RAW_BUFFER_COUNT` from 16 to **32** (must remain a power of 2 — used with
+`& (RAW_BUFFER_COUNT - 1)` mask for lock-free head/tail wrapping):
+
+```c
+// Before
+#define RAW_BUFFER_COUNT (16)
+
+// After — F4TNK: 16 → 32 (2026-02-23)
+// At 10 MSPS packed: each buffer ≈26 ms → 32 buffers = ~832 ms headroom
+// Must be power of 2 (head/tail use & mask, not modulo).
+#define RAW_BUFFER_COUNT (32)
+```
+
+| Metric | Before | After |
+|--------|--------|-------|
+| `RAW_BUFFER_COUNT` | 16 | **32** |
+| Headroom @ 10 MSPS packed | ~416 ms | **~832 ms** |
+| Memory footprint | 16 × 384 KB = 6 MB | **32 × 384 KB = 12 MB** |
+| Power of 2 compliance | ✅ | ✅ |
+
+### 🔗 Paired Fixes
+
+This change is part of a three-layer approach to eliminate USB overflows:
+
+| Layer | Fix | Headroom |
+|-------|-----|----------|
+| libairspy (this) | `RAW_BUFFER_COUNT` 16→32 | ~832 ms |
+| SoapyAirspy | Ring buffer depth 32→48 (`buffers=48`) | ~1.6 s |
+| Entrypoint | `chrt -f 50` + `mlockall` + `ionice` | Eliminates root cause |
 
 ---
 
